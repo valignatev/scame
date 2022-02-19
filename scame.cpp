@@ -95,6 +95,7 @@ void present(SR_Frame_Buffer frame_buffer) {
     GC default_gc = DefaultGC(display, default_screen);
     if(!XInitImage(&image)) {
         printf("Fucked up XImage initializationi, dawg\n");
+        exit(1);
     }
     XPutImage(display, window, default_gc, &image,
               0, 0, 0, 0, frame_buffer.width, frame_buffer.height);
