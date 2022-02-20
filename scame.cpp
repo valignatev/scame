@@ -44,6 +44,11 @@ struct String {
 // Maybe it's better to use strlen instead, won't have to subtract 1 then
 #define S(static_string) String { (u8*)static_string, ARRAY_COUNT(static_string) - 1 }
 
+// Apparently, using anonymous strutcs inside unions like in C is considered UB
+// in C++, but it's very convenient and all compilers do the right thing,
+// so I don't give a fuck about this particular part of the C++ spec
+#pragma GCC diagnostic ignored "-Wpedantic"
+// NOTE: red and blue are inverted it seems, so an actual layout is bgra
 union rgba8 {
     struct {
         u8 red, green, blue, alpha;
@@ -56,6 +61,7 @@ union rgba8 {
     u32 value32;
     u8 values8[4];
 };
+#pragma GCC diagnostic pop
 
 struct SR_Frame_Buffer {
     s32 width, height;
