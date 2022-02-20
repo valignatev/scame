@@ -1,11 +1,25 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <cmath>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
+
+#if defined DEBUG
+#define assert(expression)                                              \
+    if(!(expression)) {                                                 \
+        printf("Assert:\n%s:%i(%s):\n    " #expression "\n\n",          \
+               __FILE__, __LINE__, __FUNCTION__);                       \
+        /* POSIX-specific. Will be __debugbreak(); on Windows */        \
+        raise(SIGTRAP);                                                 \
+        exit(1);                                                        \
+    }
+#else
+#define assert(...)
+#endif
 
 #define ARRAY_COUNT(static_array) ( sizeof(static_array) / sizeof(*(static_array)) )
 
@@ -66,6 +80,81 @@ SR_Frame_Buffer make_frame_buffer(s32 width, s32 height) {
     return frame_buffer;
 }
 
+void fill_box(SR_Frame_Buffer* frame_buffer,
+              s32 x, s32 y, s32 width, s32 height, rgba8 color) {
+    // If x or y are negative, we decrease the size of the box we draw,
+    // as if would be partially off-screen
+    if(x < 0) {
+        width += x;
+        x = 0;
+    }
+
+    if(y < 0) {
+        height += y;
+        y = 0;
+    }
+
+    if(x >= frame_buffer->width)
+        return;
+
+    if(y >= frame_buffer->height)
+        return;
+    s32 end_x = std::min(x + width, frame_buffer->width);
+    s32 end_y = std::min(y + height, frame_buffer->height);
+
+    // Iterating row by row
+    // I want (0,0) to be in the bottom-left corner, but XImage has (0,0) in the
+    // top left. So we're iterating from bottom to top.
+    s32 y_inverted_start = frame_buffer->height - 1 - y;
+    s32 y_inverted_end = frame_buffer->height - 1 - end_y;
+    for(s32 y_it = y_inverted_start; y_it > y_inverted_end; y_it--) {
+        for(s32 x_it = x; x_it < end_x; x_it++) {
+            frame_buffer->base[y_it * frame_buffer->width + x_it] = color;
+        }
+    }
+}
+
+void blit(SR_Frame_Buffer* dest, s32 dest_x, s32 dest_y,
+          SR_Frame_Buffer* src, s32 src_x, s32 src_y, s32 src_width, s32 src_height) {
+    assert(dest->base != src->base);
+    assert((0 <= src_x) && (src_x < src->width));
+    assert((0 <= src_y) && (src_y < src->height));
+    assert(src_width >= 0);
+    assert(src_x + src_width <= src->width);
+    assert(src_height >=0);
+    assert(src_y + src_height <= src->height);
+
+    if(dest_x < 0) {
+        src_width += dest_x;
+        src_x -= dest_x;
+        dest_x = 0;
+    }
+
+    if(dest_y < 0) {
+        src_height += dest_y;
+        src_y -= dest_y;
+        dest_y = 0;
+    }
+
+    if(dest_x >= dest->width) {
+        return;
+    }
+    if(dest_y >= dest->height) {
+        return;
+    }
+
+    s32 width = std::min(src_width, dest->width - dest_x);
+    s32 height = std::min(src_height, dest->height - dest_y);
+
+    for(s32 y = 0; y < height; y++) {
+        for(s32 x = 0; x < width; x++) {
+            // Should we also invert Y of the source buffer?
+            auto color = src->base[(y + src_y) * src->width + x + src_x];
+            dest->base[(dest->height - 1 - dest_y - y) * dest->width + x + dest_x] = color;
+        }
+    }
+}
+
 void present(SR_Frame_Buffer frame_buffer) {
     if((frame_buffer.width <= 0) || (frame_buffer.height <= 0)) {
         return;
@@ -73,7 +162,7 @@ void present(SR_Frame_Buffer frame_buffer) {
 
     // We're manually creating XImage here instead of calling
     // XCreateImage so we manually manage its memory instead of letting
-    // xlib to allocate it on the heap with calloc. 
+    // xlib to allocate it on the heap with calloc.
     XImage image = {};
     image.width = frame_buffer.width;
     image.height = frame_buffer.height;
@@ -180,7 +269,7 @@ int main() {
 
     XStoreName(display, window, "Scame");
     set_size_hint(display, window, 400, 300, 0, 0);
-    
+
     XIM x_input_method = XOpenIM(display, 0, 0, 0);
     if(!x_input_method)
         printf("Input Method could not be opened\n");
@@ -214,6 +303,15 @@ int main() {
 
     // The Buffer
     auto frame_buffer = make_frame_buffer(width, height);
+    auto test_buffer = make_frame_buffer(200, 200);
+    for(s32 x = 0; x < test_buffer.width; x++) {
+        test_buffer.base[0 * test_buffer.width + x] = {0, 0, 255, 0};
+        test_buffer.base[(test_buffer.height - 1) * test_buffer.width + x] = {0, 0, 255, 0};
+    }
+    for(s32 y = 0; y < test_buffer.height; y++) {
+        test_buffer.base[y * test_buffer.width + 0] = {0, 0, 255, 0};
+        test_buffer.base[y* test_buffer.width + test_buffer.width - 1] = {0, 0, 255, 0};
+    }
 
     Atom WM_DELETE_WINDOW = XInternAtom(display, "WM_DELETE_WINDOW", False);
     if(!XSetWMProtocols(display, window, &WM_DELETE_WINDOW, 1))
@@ -221,6 +319,7 @@ int main() {
 
     int size_change = 0;
     int window_open = 1;
+    rgba8 clear_color = {0, 128, 128, 0};
     while(window_open) {
         XEvent ev = {};
         while(XPending(display) > 0) {
@@ -269,19 +368,10 @@ int main() {
             frame_buffer = make_frame_buffer(width, height);
         }
 
-        int pitch = width * sizeof(rgba8);
-        for(int x = 0; x < width; x++) {
-            for(int y = 0; y < height; y++) {
-                u8* row = (u8*)frame_buffer.base + (y * pitch);
-                u32* p = (u32*) (row + (x * sizeof(rgba8)));
-                if(x % 16 && y % 16) {
-                    //     AARRGGBB
-                    *p = 0x00ffffff;
-                } else {
-                    *p = 0;
-                }
-            }
-        }
+        fill_box(&frame_buffer, 0, 0, frame_buffer.width, frame_buffer.height, clear_color);
+        fill_box(&frame_buffer, -50, 20, 100, 100, {255, 0, 0, 0});
+
+        blit(&frame_buffer, frame_buffer.width - 100, frame_buffer.height - 100, &test_buffer, 0, 0, test_buffer.width, test_buffer.height);
         present(frame_buffer);
     }
 
