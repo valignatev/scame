@@ -1,30 +1,53 @@
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <cmath>
+#include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 
+#define ARRAY_COUNT(static_array) ( sizeof(static_array) / sizeof(*(static_array)) )
+
 #if defined DEBUG
-#define assert(expression)                                              \
+#define assert(expression, ...)                                         \
     if(!(expression)) {                                                 \
-        printf("Assert:\n%s:%i(%s):\n    " #expression "\n\n",          \
+        if(ARRAY_COUNT(#__VA_ARGS__) - 1) {                             \
+            printf("\n" __VA_ARGS__);                                   \
+        }                                                               \
+        printf("\nin: %s:%i(%s):\n    " #expression "\n\n",             \
                __FILE__, __LINE__, __FUNCTION__);                       \
         /* POSIX-specific. Will be __debugbreak(); on Windows */        \
         raise(SIGTRAP);                                                 \
         exit(1);                                                        \
     }
 #else
-#define assert(...)
+#define assert(expression, ...)                 \
+    if(!(expression)) {                         \
+        if(ARRAY_COUNT(#__VA_ARGS__) - 1) {     \
+            printf("\n" __VA_ARGS__);           \
+            exit(1);                            \
+        }                                       \
+    }
 #endif
 
-#define ARRAY_COUNT(static_array) ( sizeof(static_array) / sizeof(*(static_array)) )
+void stbtt_assert_wrapper(int expression) {
+    assert(expression);
+}
 
+#define STB_TRUETYPE_IMPLEMENTATION
+#define STBTT_assert(expression) stbtt_assert_wrapper(expression)
+#include "stb_truetype.h"
+
+typedef char* cstring;
 typedef uint8_t u8;
 typedef int32_t s32;
+typedef float f32;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef uint64_t usize;
@@ -36,10 +59,12 @@ int default_screen;
 XVisualInfo visinfo;
 Window window;
 
-struct String {
-    u8 *base;
+struct u8_array {
+    u8* base;
     usize count;
 };
+
+typedef u8_array String;
 
 // Maybe it's better to use strlen instead, won't have to subtract 1 then
 #define S(static_string) String { (u8*)static_string, ARRAY_COUNT(static_string) - 1 }
@@ -70,10 +95,7 @@ struct SR_Frame_Buffer {
 
 u8* platform_allocate_bytes(usize byte_count) {
     u8* base = (u8*)malloc(byte_count);
-    if (!base) {
-        printf("ERROR: out of memory\n");
-        exit(1);
-    }
+    assert(base, "ERROR: out of memory");
     return base;
 }
 
@@ -188,12 +210,9 @@ void present(SR_Frame_Buffer frame_buffer) {
     image.bytes_per_line = 0;
 
     GC default_gc = DefaultGC(display, default_screen);
-    if(!XInitImage(&image)) {
-        printf("Fucked up XImage initializationi, dawg\n");
-        exit(1);
-    }
+    assert(XInitImage(&image), "Fucked up XImage initializationi, dawg");
     XPutImage(display, window, default_gc, &image,
-              0, 0, 0, 0, frame_buffer.width, frame_buffer.height);
+              0, 0, 0, 0, image.width, image.height);
 }
 
 void set_size_hint(Display* display, Window window,
@@ -233,6 +252,26 @@ Status toggle_maximize(Display* display, Window window) {
                       (XEvent*)&ev);
 }
 
+u8_array platform_read_entire_file(cstring file_path) {
+
+    u8_array result = {};
+    int fd = open(file_path, O_RDONLY);
+    assert(fd > -1, "Couldn't open the file %s", file_path);
+
+    struct stat statbuf;
+    int err = fstat(fd, &statbuf);
+    assert(err > -1, "Couldn't open the file %s", file_path);
+
+    auto memory = (u8*)mmap(NULL, statbuf.st_size, PROT_READ, MAP_SHARED,
+                            fd, 0);
+    assert(memory != MAP_FAILED, "Couldn't read the file's contents");
+    close(fd);
+
+    result.base = memory;
+    result.count = statbuf.st_size;
+    return result;
+}
+
 int main() {
     int width = 800;
     int height = 600;
@@ -248,10 +287,8 @@ int main() {
 
     int screen_bit_depth = 24;
     visinfo = {};
-    if(!XMatchVisualInfo(display, default_screen, screen_bit_depth, TrueColor, &visinfo)) {
-        printf("No matching visual info\n");
-        exit(1);
-    }
+    assert(XMatchVisualInfo(display, default_screen, screen_bit_depth, TrueColor, &visinfo),
+           "No matching visual info");
 
     XSetWindowAttributes window_attr;
     // This helps with flickering. Default value is ForgetGravity, which
@@ -263,6 +300,7 @@ int main() {
     window_attr.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask;
     u64 attribute_mask = CWBitGravity | CWBackPixel | CWColormap | CWEventMask;
 
+    // Windowing
     window = XCreateWindow(display, root_window,
                                   0, 0,
                                   width, height, 0,
@@ -276,6 +314,7 @@ int main() {
     XStoreName(display, window, "Scame");
     set_size_hint(display, window, 400, 300, 0, 0);
 
+    // Input setup
     XIM x_input_method = XOpenIM(display, 0, 0, 0);
     if(!x_input_method)
         printf("Input Method could not be opened\n");
@@ -326,6 +365,67 @@ int main() {
     int size_change = 0;
     int window_open = 1;
     rgba8 clear_color = {0, 128, 128, 0};
+
+    // Font stuff
+    auto font_atlas = make_frame_buffer(256, 256);
+    {
+        stbtt_fontinfo font;
+        auto ttf_data = platform_read_entire_file("/usr/share/fonts/TTF/Hack-Regular.ttf");
+
+        auto ok = stbtt_InitFont(&font, ttf_data.base, 0);
+        assert(ok, "stb_truetype couldn't initialize a font");
+
+        f32 pixel_height = 17 * 2.18; // 2.18 is my laptop's hidpi scale factor
+        f32 scale = stbtt_ScaleForPixelHeight(&font, pixel_height);
+        s32 ascent;
+        s32 descent;
+        s32 line_gap;
+        stbtt_GetFontVMetrics(&font, &ascent, &descent, &line_gap);
+
+        s32 line_spacing = scale * (ascent - descent + line_gap);
+
+        u8_array glyph_buffer;
+        glyph_buffer.count = 64 * 64;
+        glyph_buffer.base = platform_allocate_bytes(glyph_buffer.count);
+
+        s32 x_offset = 0;
+        s32 y_offset = 0;
+        s32 y_max_height = 0;
+        for(u32 code_point = ' '; code_point < 128; code_point++) {
+            s32 x0, x1, y0, y1;
+            stbtt_GetCodepointBitmapBoxSubpixel(&font, code_point, scale, scale, 0, 0,
+                                                &x0, &y0, &x1, &y1);
+            s32 width = x1 - x0;
+            s32 height = y1 - y0;
+            stbtt_MakeCodepointBitmapSubpixel(&font, glyph_buffer.base, width, height,
+                                              width, scale, scale, 0, 0, code_point);
+
+
+            if(x_offset + width + 1 > font_atlas.width) {
+                x_offset = 0;
+                y_offset += y_max_height;
+                assert(y_offset + height <= font_atlas.height);
+            }
+            y_max_height = std::max(y_max_height, height);
+
+            for(s32 y = 0; y < height; y++) {
+                for(s32 x = 0; x < width; x++) {
+                    rgba8 color;
+                    color.r = glyph_buffer.base[y * width + x];
+                    color.g = color.r;
+                    color.b = color.r;
+                    color.a = color.r;
+                    // stb_truetype has top to bottom Y coordinate, flip it
+                    font_atlas.base[(height - 1 - y + y_offset) * font_atlas.width + x + x_offset] = color;
+                }
+            }
+
+            x_offset += width + 1;
+            assert(x_offset <= font_atlas.width);
+        }
+    }
+
+    // Event loop
     while(window_open) {
         XEvent ev = {};
         while(XPending(display) > 0) {
@@ -349,6 +449,12 @@ int main() {
                 width = e->width;
                 height = e->height;
                 size_change = 1;
+                if(size_change) {
+                    size_change = 0;
+                    // Maybe realloc is better;
+                    free(frame_buffer.base);
+                    frame_buffer = make_frame_buffer(width, height);
+                }
             } break;
             case KeyPress: {
                 auto e = (XKeyPressedEvent*)&ev;
@@ -367,17 +473,10 @@ int main() {
             }
         }
 
-        if(size_change) {
-            size_change = 0;
-            // Maybe realloc is better;
-            free(frame_buffer.base);
-            frame_buffer = make_frame_buffer(width, height);
-        }
-
         fill_box(&frame_buffer, 0, 0, frame_buffer.width, frame_buffer.height, clear_color);
-        fill_box(&frame_buffer, -50, 20, 100, 100, {255, 0, 0, 0});
 
         blit(&frame_buffer, frame_buffer.width - 100, frame_buffer.height - 100, &test_buffer, 0, 0, test_buffer.width, test_buffer.height);
+        blit(&frame_buffer, 10, 10, &font_atlas, 0, 0, font_atlas.width, font_atlas.height);
         present(frame_buffer);
     }
 
